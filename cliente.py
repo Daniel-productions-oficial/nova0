@@ -1,71 +1,97 @@
 import requests
 import json
 import os
-import pygame
 import time
-from gtts import gTTS
-import tempfile
+import pyttsx3
+
 # Configuración
 API_URL = "http://localhost:8000/v1/completions"
 
-def hablar(texto):
-    """Convierte texto a audio localmente y lo reproduce."""
-    if not texto.strip():
-        return
+# --- INICIALIZACIÓN GLOBAL DEL MOTOR ---
+engine = pyttsx3.init()
 
+def configurar_voz_espanol():
+    """Busca una voz en español disponible en el sistema."""
     try:
-        # 1. Crear el objeto TTS
-        tts = gTTS(text=texto, lang="es", tld="com.mx") # TLD de México para mejor acento
-        
-        # 2. Guardar en un archivo temporal
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as fp:
-            temp_path = fp.name
-            tts.save(temp_path)
-
-        # 3. Reproducir con Pygame
-        pygame.mixer.init()
-        pygame.mixer.music.load(temp_path)
-        pygame.mixer.music.play()
-
-        # Esperar a que termine de hablar
-        while pygame.mixer.music.get_busy():
-            time.sleep(0.1)
-        
-        pygame.mixer.quit()
-
-        # 4. Limpieza: Borrar archivo temporal
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
-            
+        voices = engine.getProperty('voices')
+        for voice in voices:
+            if 'es' in voice.id.lower() or 'spanish' in voice.name.lower():
+                engine.setProperty('voice', voice.id)
+                return True
     except Exception as e:
-        print(f"\n[Error de Voz] No se pudo generar el audio: {e}")
+        print(f"Error configurando voz: {e}")
+    return False
+
+# Aplicar configuración inicial
+configurar_voz_espanol()
+engine.setProperty('rate', 155) # Un poco más rápido para fluidez en streaming
+engine.setProperty('volume', 1.0)
+
+def hablar(texto):
+    """Función atómica para procesar un fragmento de texto."""
+    texto = texto.strip()
+    if not texto:
+        return
+    try:
+        # Nota: pyttsx3 es síncrono, detendrá el print hasta que termine de hablar
+        engine.say(texto)
+        engine.runAndWait()
+    except Exception as e:
+        print(f"\n[Error de Voz] {e}")
 
 def chat():
-    print("--- KAMUTINI CLIENT (Local TTS) ---")
+    print("--- KAMUTINI CLIENT (Voz por Párrafos) ---")
     while True:
         prompt = input("\n\nTú: ")
-        if prompt.lower() in ["salir", "exit"]: break
+        if prompt.lower() in ["salir", "exit", "quit"]: 
+            break
 
-        payload = {"prompt": prompt}
-        respuesta_completa = ""
-
+        payload = {"prompt": prompt, "stream": True} # Aseguramos modo stream
+        
         print("\nKamutini: ", end="", flush=True)
+        
+        # Búfer para acumular texto hasta encontrar un salto de línea
+        bufer_voz = ""
 
         try:
             with requests.post(API_URL, json=payload, stream=True) as r:
                 for line in r.iter_lines():
                     if line:
-                        chunk_data = json.loads(line.decode("utf-8"))
-                        if "choices" in chunk_data:
-                            texto = chunk_data["choices"][0]["text"]
-                            print(texto, end="", flush=True)
-                            respuesta_completa += texto
-            
-            # Al terminar el texto, Kamutini habla
-            hablar(respuesta_completa)
+                        # Limpiamos el prefijo 'data: ' si el servidor lo envía (estándar SSE)
+                        decoded_line = line.decode("utf-8")
+                        if decoded_line.startswith("data: "):
+                            decoded_line = decoded_line[6:]
+                        
+                        try:
+                            chunk_data = json.loads(decoded_line)
+                            if "choices" in chunk_data:
+                                texto_chunk = chunk_data["choices"][0]["text"]
+                                
+                                # 1. Mostrar en consola inmediatamente
+                                print(texto_chunk, end="", flush=True)
+                                
+                                # 2. Acumular para la voz
+                                bufer_voz += texto_chunk
+                                
+                                # 3. Si detectamos un salto de línea, hablamos ese párrafo
+                                if "\n" in bufer_voz:
+                                    # Dividimos por si hay múltiples saltos
+                                    parrafos = bufer_voz.split("\n")
+                                    # Hablamos todos menos el último (que podría estar incompleto)
+                                    for p in parrafos[:-1]:
+                                        hablar(p)
+                                    # El último fragmento vuelve al búfer
+                                    bufer_voz = parrafos[-1]
+                        
+                        except json.JSONDecodeError:
+                            continue
+
+            # Hablar el remanente final después de que el stream cierre
+            if bufer_voz.strip():
+                hablar(bufer_voz)
 
         except requests.exceptions.ConnectionError:
-            print("\n[Error] No se pudo conectar con el servidor. ¿Está encendido?")
+            print("\n[Error] El servidor no responde. ¿Iniciaste el backend?")
 
 if __name__ == "__main__":
     chat()
